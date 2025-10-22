@@ -1,0 +1,5 @@
+# Deployment log files
+deploy_*.log
+
+# General log files
+*.log
