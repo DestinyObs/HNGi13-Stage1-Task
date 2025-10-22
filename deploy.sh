@@ -45,6 +45,19 @@ if [ -z "$GIT_REPO" ] || [ -z "$PAT" ] || [ -z "$REMOTE_USER" ] || [ -z "$REMOTE
     exit 2
 fi
 
+# Validate Git URL format
+if ! printf '%s' "$GIT_REPO" | grep -Eq '^https://.*\.git$|^https://[^/]+/[^/]+/[^/]+$'; then
+    log "Invalid Git repository URL format."
+    exit 2
+fi
+
+# Validate SSH key exists
+if [ ! -f "$SSH_KEY" ]; then
+    log "SSH key not found at: $SSH_KEY"
+    exit 2
+fi
+
+# Validate port is numeric
 if ! printf '%s' "$APP_PORT" | grep -Eq '^[0-9]+$'; then
     log "Application port must be a number."
     exit 3
@@ -57,8 +70,13 @@ REPO_NAME=$(basename -s .git "$GIT_REPO")
 SANITIZED_NAME=$(printf '%s' "$REPO_NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-_')
 
 if [ -d "$REPO_NAME" ]; then
-    log "Repository '$REPO_NAME' exists locally — pulling latest changes on branch '$BRANCH'."
-    (cd "$REPO_NAME" && git fetch --all && git checkout "$BRANCH" && git pull origin "$BRANCH") | tee -a "$LOG_FILE"
+    if [ -d "$REPO_NAME/.git" ]; then
+        log "Repository '$REPO_NAME' exists locally — pulling latest changes on branch '$BRANCH'."
+        (cd "$REPO_NAME" && git fetch --all && git checkout "$BRANCH" && git pull origin "$BRANCH") | tee -a "$LOG_FILE"
+    else
+        log "Directory '$REPO_NAME' exists but is not a git repository. Please remove it or use a different location."
+        exit 2
+    fi
 else
     log "Cloning repository..."
     # embed PAT into https URL for cloning
@@ -90,11 +108,21 @@ fi
 # -------------------------------
 # 4. Test SSH Connection
 # -------------------------------
+log "Testing network connectivity to $REMOTE_IP..."
+if command -v ping >/dev/null 2>&1; then
+    if ping -c 2 -W 3 "$REMOTE_IP" >/dev/null 2>&1; then
+        log "Ping successful."
+    else
+        log "Warning: Ping failed, but continuing with SSH test..."
+    fi
+fi
+
 log "Testing SSH connection to $REMOTE_USER@$REMOTE_IP..."
 if ! ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_USER@$REMOTE_IP" 'echo SSH_OK' >/dev/null 2>&1; then
     log "SSH connection failed. Exiting."
     exit 5
 fi
+log "SSH connection successful."
 
 # -------------------------------
 # 5. Prepare Remote Environment
@@ -167,15 +195,20 @@ APP_PORT="$2"
 NGINX_CONF_PATH="/etc/nginx/sites-available/${SANITIZED_NAME}.conf"
 NGINX_LINK_PATH="/etc/nginx/sites-enabled/${SANITIZED_NAME}.conf"
 
+# Remove default nginx site to avoid conflicts
+sudo rm -f /etc/nginx/sites-enabled/default
+
 sudo bash -c "cat > ${NGINX_CONF_PATH}" <<'NGINX_CONF'
 server {
-    listen 80;
+    listen 80 default_server;
     server_name _;
+    
     location / {
         proxy_pass http://127.0.0.1:APP_PORT_PLACEHOLDER;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 NGINX_CONF
@@ -184,6 +217,7 @@ sudo sed -i "s/APP_PORT_PLACEHOLDER/${APP_PORT}/g" "${NGINX_CONF_PATH}"
 sudo ln -sf "${NGINX_CONF_PATH}" "${NGINX_LINK_PATH}"
 sudo nginx -t
 sudo systemctl reload nginx
+echo "Nginx configured and reloaded successfully"
 REMOTE
 
 # -------------------------------
@@ -193,23 +227,48 @@ log "Validating deployment on remote host..."
 ssh -i "$SSH_KEY" "$REMOTE_USER@$REMOTE_IP" bash -s "$APP_PORT" <<'REMOTE'
 set -e
 APP_PORT="$1"
-echo "Docker service status:"
-sudo systemctl is-active --quiet docker && echo "docker: active" || echo "docker: inactive"
-echo ""
-echo "Running containers:"
-sudo docker ps
-echo ""
-echo "Nginx status:"
-sudo systemctl is-active --quiet nginx && echo "nginx: active" || echo "nginx: inactive"
-echo ""
-if command -v curl >/dev/null 2>&1; then
-  echo "Testing container on port ${APP_PORT}:"
-  curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:${APP_PORT} || echo "Failed to reach container"
-  echo ""
-  echo "Testing Nginx proxy on port 80:"
-  curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:80 || echo "Failed to reach Nginx proxy"
+
+echo "=== Docker Service Status ==="
+if sudo systemctl is-active --quiet docker; then
+    echo "Docker service: ACTIVE"
+    sudo systemctl status docker --no-pager | head -n 3
 else
-  echo "curl not available; skipping HTTP checks"
+    echo "Docker service: INACTIVE"
+    exit 1
+fi
+
+echo ""
+echo "=== Running Containers ==="
+sudo docker ps
+
+echo ""
+echo "=== Nginx Service Status ==="
+if sudo systemctl is-active --quiet nginx; then
+    echo "Nginx service: ACTIVE"
+    sudo systemctl status nginx --no-pager | head -n 3
+else
+    echo "Nginx service: INACTIVE"
+fi
+
+echo ""
+echo "=== Application Health Check ==="
+if command -v curl >/dev/null 2>&1; then
+    echo "Testing container on port ${APP_PORT}:"
+    if curl -sf -o /dev/null http://127.0.0.1:${APP_PORT}; then
+        echo "✓ Container responding on port ${APP_PORT}"
+    else
+        echo "✗ Container not responding on port ${APP_PORT}"
+    fi
+    
+    echo ""
+    echo "Testing Nginx reverse proxy on port 80:"
+    if curl -sf -o /dev/null http://127.0.0.1:80; then
+        echo "✓ Nginx proxy responding on port 80"
+    else
+        echo "✗ Nginx proxy not responding on port 80"
+    fi
+else
+    echo "curl not available; skipping HTTP checks"
 fi
 REMOTE
 
